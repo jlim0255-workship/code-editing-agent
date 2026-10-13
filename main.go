@@ -13,8 +13,6 @@ import (
 )
 
 func main() {
-	// client := anthropic.NewClient()
-	// #fixed client = api.NewClient(url.Parse("http://localhost:11434"), http.DefaultClient)
 	baseURL, err := url.Parse("http://localhost:11434")
 	if err != nil {
 		fmt.Printf("Invalid Ollama URL: %s\n", err)
@@ -25,7 +23,6 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	// fixed signature to match NewAgent signature
-	// #fixed getUserMessage := func(string, bool){
 	getUserMessage := func() (string, bool) {
 		if !scanner.Scan() {
 			return "", false
@@ -35,7 +32,6 @@ func main() {
 	}
 
 	// pass the ollama client pointer
-	// #fixed agent := NewAgent(&client, getUserMessage)
 	agent := NewAgent(client, getUserMessage)
 	// #fixed err := agent.Run(context.TODO())
 	err = agent.Run(context.TODO())
@@ -58,7 +54,6 @@ type Agent struct {
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	// conversation := []anthropic.MessageParam{}
 	// maintain conversation
 	conversation := []api.Message{}
 
@@ -72,7 +67,6 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 
 		// append the new User message
-		// userMessage := anthropic.NewUserMessage(anthropic.NewTextBlock(userInput))
 		userMessage := api.Message{
 			Role:    "user",
 			Content: userInput,
@@ -86,7 +80,6 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 
 		// append ollama's response directly to history (it is already on api.Message)
-		// #fixed conversation = append(conversation, assistantMessage.ToParam())
 		conversation = append(conversation, *assistantMessage)
 
 		// #fixed for _, content := range assistantMessage.Content { ... }
@@ -106,7 +99,7 @@ func (a *Agent) runInference(ctx context.Context, conversation []api.Message) (*
 		Stream:   new(bool), // Defaults to false, or pass a false pointer explicitly if needed
 	}
 
-	// 6. Define the response callback (Ollama streams by default unless Stream is set false/handled in pieces)
+	// Define the response callback (Ollama streams by default unless Stream is set false/handled in pieces)
 	// Even with Stream: false, Ollama executes this callback block once with the complete answer.
 	err := a.client.Chat(ctx, req, func(resp api.ChatResponse) error {
 		// #fixed response = resp.Message
@@ -116,61 +109,4 @@ func (a *Agent) runInference(ctx context.Context, conversation []api.Message) (*
 
 	// #fixed return response, err
 	return &response, err
-
-	// message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-	// 	Model:     anthropic.ModelClaude3_7SonnetLatest,
-	// 	MaxTokens: int64(1024),
-	// 	Messages:  conversation,
-	// })
-	// return message, err
 }
-
-// ollama endpoints
-// Ollama exposes several key endpoints that we’ll work with:
-
-// /api/generate - Generate text based on a prompt (supports streaming)
-// /api/chat - Handle multi-turn conversations with message history
-// /api/embeddings - Create vector embeddings for text
-// /api/tags - List all pulled models
-
-// import (
-// 	"bytes"
-// 	"encoding/json"
-// 	"fmt"
-// 	"io"
-// 	"net/http"
-// )
-
-// func main(){
-
-// 	// request payload
-// 	payload := map[string]interface{}{
-// 		"model": "gemma4:e2b",
-// 		"prompt": "What is the capital of France?",
-// 		"stream": true
-// 	}
-
-// 	payloadBytes, _ := json.Marshal(payload)
-
-// 	// make the POST request
-// 	response, err := http.Post(
-// 		"http://localhost:11434/api/generate",
-// 		"application/json",
-// 		bytes.NewBuffer(payloadBytes),
-// 	)
-
-// 	if err != nil {
-// 		fmt.Println("Error making request:", err)
-// 		return
-// 	}
-
-// 	defer response.Body.Close()
-
-// 	// read and parse the response body
-// 	body, _ := io.ReadAll(response.Body)
-// 	var result map[string]interface{}
-// 	json.Unmarshal(body, &result)
-
-// 	fmt.Println("Response:", result["response"])
-
-// }
