@@ -115,7 +115,6 @@ func main() {
 	tools := []ToolDefinition{ReadFileDefinition}
 	agent := NewAgent(client, getUserMessage, tools)
 	
-	// #fixed err := agent.Run(context.TODO())
 	err = agent.Run(context.TODO())
 
 	if err != nil {
@@ -129,34 +128,107 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	fmt.Println("Chat with gpt-oss:120b-cloud (use ctrl + c to quit)")
 
-	for {
-		fmt.Print("\x1b[34mYou\x1b[94m: ")
-		userInput, ok := a.getUserMessage()
-		if !ok {
-			break
-		}
+	readUserInput := true
 
-		// append the new User message
-		userMessage := api.Message{
-			Role:    "user",
-			Content: userInput,
+	for {
+		if readUserInput {
+			fmt.Print("\x1b[34mYou\x1b[94m: ")
+			userInput, ok := a.getUserMessage()
+			if !ok {
+				break
+			}
+
+			// append the new User message
+			userMessage := api.Message{
+				Role:    "user",
+				Content: userInput,
+			}
+			conversation = append(conversation, userMessage)
 		}
-		conversation = append(conversation, userMessage)
 
 		// run ollama inference
 		assistantMessage, err := a.runInference(ctx, conversation)
 		if err != nil {
 			return err
 		}
-
 		// append ollama's response directly to history (it is already on api.Message)
 		conversation = append(conversation, *assistantMessage)
 
-		// #fixed for _, content := range assistantMessage.Content { ... }
-		fmt.Printf("\x1b[35mAssistant\x1b[95m: %s\n", assistantMessage.Content)
+		if assistantMessage.Content != ""{
+			fmt.Printf("\x1b[35mGPT\x1b[95m: %s\n", assistantMessage.Content)
+		}
+		
+		toolResults := []api.Message{}
+		for _, call := range assistantMessage.ToolCalls {
+			input, err := json.Marshal(call.Function.Arguments.ToMap())
+			if err != nil {
+				return err
+			}
+
+			switch call.Function.Name {
+			case "read_file":
+				result := a.executeTool(call.ID, call.Function.Name, input)
+				toolResults = append(toolResults, result)
+
+			default:
+				toolResults = append(toolResults, api.Message{
+					Role:       "tool",
+					ToolName:   call.Function.Name,
+					ToolCallID: call.ID,
+					Content:    "tool error: unknown tool",
+				})
+			}
+		}
+		if len(toolResults) == 0 {
+			readUserInput = true
+			continue
+		}
+		readUserInput = false
+		conversation = append(conversation, toolResults...)
 	}
 
 	return nil
+}
+
+// func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.ContentBlockParamUnion {
+func (a *Agent) executeTool(id, name string, input json.RawMessage) api.Message{
+	var toolDef ToolDefinition
+	var found bool
+	for _, tool := range a.tools {
+		if tool.Name == name {
+			toolDef = tool
+			found = true
+			break
+		}
+	}
+	if !found {
+		return api.Message{
+			Role:       "tool",
+			ToolName:   name,
+			ToolCallID: id,
+			Content:    "tool error: tool not found",
+		}
+	}
+
+	fmt.Printf("\033[32mtool\033[0m:%s(%s)\n", name, input)
+	response, err := toolDef.Function(input)
+	if err != nil {
+		// return anthropic.NewToolResultBlock(id, err.Error(), true)
+		return api.Message{
+			Role: "tool",
+			ToolName: name,
+			ToolCallID: id,
+			Content: "tool error: " + err.Error(),
+		}
+	}
+	// return anthropic.NewToolResultBlock(id, response, false)
+
+	return api.Message{
+		Role:       "tool",
+		ToolName:   name,
+		ToolCallID: id,
+		Content:    response,
+	}
 }
 
 func (a *Agent) runInference(ctx context.Context, conversation []api.Message) (*api.Message, error) {
