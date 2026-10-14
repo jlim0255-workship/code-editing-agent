@@ -25,6 +25,12 @@ A function that actually executes the tool with the input the model sends to us 
 
 Under the hood, this will all end up as strings that are sent to the model.
 
+# Milestones
+## V1: basic harness with 3 tools (read, list, edit files) [DONE]
+## V2: select models to use (ollama)
+## V3: apply 6 layer harness
+## V4: apply deep eval
+
 # Demonstration
 ## Edit tool use case
 PS D:\code-editing-agent> go run main.go                                                                                                                                                                                  
