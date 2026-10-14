@@ -3,18 +3,232 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"path/filepath"
+	"path"
+	"strings"
 	"os"
 
 	// "github.com/anthropics/anthropic-sdk-go"
 	"github.com/ollama/ollama/api"
+	"github.com/invopop/jsonschema"
 )
 
+type ToolDefinition struct {
+	Name string
+	Description string
+	InputSchema api.ToolFunctionParameters
+	Function func(input json.RawMessage) (string, error)
+}
+
+type Agent struct {
+	client *api.Client
+	getUserMessage func() (string, bool)
+	tools []ToolDefinition
+}
+
+func NewAgent(
+	client *api.Client, 
+	getUserMessage func() (string, bool),
+	tools []ToolDefinition,
+	)*Agent {
+	return &Agent{
+		client: client,
+		getUserMessage: getUserMessage,
+		tools: tools,
+	}
+}
+
+// read_file tools
+var ReadFileDefinition = ToolDefinition{
+	Name: "read_file",
+	Description: "Read the contents of a given relative file path. Use this when you want to see what's inside a file. Do not use this with directory names.",
+	InputSchema: ReadFileInputSchema,
+	Function: ReadFile,
+}
+
+type ReadFileInput struct {
+	Path string `json:"path" jsonschema_description:"The relative path of a file in the working directory."`
+}
+
+var ReadFileInputSchema = GenerateSchema[ReadFileInput]()
+
+func ReadFile(input json.RawMessage) (string, error) {
+	readFileInput := ReadFileInput{}
+	err := json.Unmarshal(input, &readFileInput)
+	if err != nil {
+		panic(err)
+	}
+
+	content, err := os.ReadFile(readFileInput.Path)
+	if err != nil {
+		return "", err
+	}
+	return string(content), nil
+}
+
+func GenerateSchema[T any]() api.ToolFunctionParameters {
+	// TODO: understand this
+	reflector := jsonschema.Reflector{
+		AllowAdditionalProperties: false,
+		DoNotReference:            true,
+	}
+	var v T
+
+	schema := reflector.Reflect(v)
+
+	// invopop/jsonschema and Ollama use different property-map types. JSON is
+	// the common JSON Schema representation, so use it to convert safely.
+	schemaJSON, err := json.Marshal(schema)
+	if err != nil {
+		panic(fmt.Sprintf("marshal generated schema: %v", err))
+	}
+
+	var parameters api.ToolFunctionParameters
+	if err := json.Unmarshal(schemaJSON, &parameters); err != nil {
+		panic(fmt.Sprintf("convert generated schema for Ollama: %v", err))
+	}
+
+	return parameters
+}
+
+// list_files tool
+
+var ListFilesDefinition = ToolDefinition{
+	Name:        "list_files",
+	Description: "List files and directories at a given path. If no path is provided, lists files in the current directory.",
+	InputSchema: ListFilesInputSchema,
+	Function:    ListFiles,
+}
+
+type ListFilesInput struct {
+	Path string `json:"path,omitempty" jsonschema_description:"Optional relative path to list files from. Defaults to current directory if not provided."`
+}
+
+var ListFilesInputSchema = GenerateSchema[ListFilesInput]()
+
+func ListFiles(input json.RawMessage) (string, error) {
+	listFilesInput := ListFilesInput{}
+	err := json.Unmarshal(input, &listFilesInput)
+	if err != nil {
+		panic(err)
+	}
+
+	dir := "."
+	if listFilesInput.Path != "" {
+		dir = listFilesInput.Path
+	}
+
+	var files []string
+	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+
+		if relPath != "." {
+			if info.IsDir() {
+				files = append(files, relPath+"/")
+			} else {
+				files = append(files, relPath)
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	result, err := json.Marshal(files)
+	if err != nil {
+		return "", err
+	}
+
+	return string(result), nil
+}
+
+// edit file tool
+var EditFileDefinition = ToolDefinition{
+	Name: "edit_file",
+	Description: `Make edits to a text file.
+
+Replaces 'old_str' with 'new_str' in the given file. 'old_str' and 'new_str' MUST be different from each other.
+
+If the file specified with path doesn't exist, it will be created.
+`,
+	InputSchema: EditFileInputSchema,
+	Function:    EditFile,
+}
+
+type EditFileInput struct {
+	Path   string `json:"path" jsonschema_description:"The path to the file"`
+	OldStr string `json:"old_str" jsonschema_description:"Text to search for - must match exactly and must only have one match exactly"`
+	NewStr string `json:"new_str" jsonschema_description:"Text to replace old_str with"`
+}
+
+var EditFileInputSchema = GenerateSchema[EditFileInput]()
+
+func EditFile(input json.RawMessage) (string, error) {
+	editFileInput := EditFileInput{}
+	err := json.Unmarshal(input, &editFileInput)
+	if err != nil {
+		return "", err
+	}
+
+	if editFileInput.Path == "" || editFileInput.OldStr == editFileInput.NewStr {
+		return "", fmt.Errorf("invalid input parameters")
+	}
+
+	content, err := os.ReadFile(editFileInput.Path)
+	if err != nil {
+		if os.IsNotExist(err) && editFileInput.OldStr == "" {
+			return createNewFile(editFileInput.Path, editFileInput.NewStr)
+		}
+		return "", err
+	}
+
+	oldContent := string(content)
+	newContent := strings.Replace(oldContent, editFileInput.OldStr, editFileInput.NewStr, -1)
+
+	if oldContent == newContent && editFileInput.OldStr != "" {
+		return "", fmt.Errorf("old_str not found in file")
+	}
+
+	err = os.WriteFile(editFileInput.Path, []byte(newContent), 0644)
+	if err != nil {
+		return "", err
+	}
+
+	return "OK", nil
+}
+
+func createNewFile(filePath, content string) (string, error) {
+	dir := path.Dir(filePath)
+	if dir != "." {
+		err := os.MkdirAll(dir, 0755)
+		if err != nil {
+			return "", fmt.Errorf("failed to create directory: %w", err)
+		}
+	}
+
+	err := os.WriteFile(filePath, []byte(content), 0644)
+	if err != nil {
+		return "", fmt.Errorf("failed to create file: %w", err)
+	}
+
+	return fmt.Sprintf("Successfully created file %s", filePath), nil
+}
+
+
 func main() {
-	// client := anthropic.NewClient()
-	// #fixed client = api.NewClient(url.Parse("http://localhost:11434"), http.DefaultClient)
 	baseURL, err := url.Parse("http://localhost:11434")
 	if err != nil {
 		fmt.Printf("Invalid Ollama URL: %s\n", err)
@@ -25,7 +239,6 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	// fixed signature to match NewAgent signature
-	// #fixed getUserMessage := func(string, bool){
 	getUserMessage := func() (string, bool) {
 		if !scanner.Scan() {
 			return "", false
@@ -35,9 +248,9 @@ func main() {
 	}
 
 	// pass the ollama client pointer
-	// #fixed agent := NewAgent(&client, getUserMessage)
-	agent := NewAgent(client, getUserMessage)
-	// #fixed err := agent.Run(context.TODO())
+	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition}
+	agent := NewAgent(client, getUserMessage, tools)
+	
 	err = agent.Run(context.TODO())
 
 	if err != nil {
@@ -45,58 +258,149 @@ func main() {
 	}
 }
 
-func NewAgent(client *api.Client, getUserMessage func() (string, bool)) *Agent {
-	return &Agent{
-		client:         client,
-		getUserMessage: getUserMessage,
-	}
-}
-
-type Agent struct {
-	client         *api.Client
-	getUserMessage func() (string, bool)
-}
-
 func (a *Agent) Run(ctx context.Context) error {
-	// conversation := []anthropic.MessageParam{}
 	// maintain conversation
 	conversation := []api.Message{}
 
 	fmt.Println("Chat with gpt-oss:120b-cloud (use ctrl + c to quit)")
 
-	for {
-		fmt.Print("\x1b[34mYou\x1b[94m: ")
-		userInput, ok := a.getUserMessage()
-		if !ok {
-			break
-		}
+	readUserInput := true
 
-		// append the new User message
-		// userMessage := anthropic.NewUserMessage(anthropic.NewTextBlock(userInput))
-		userMessage := api.Message{
-			Role:    "user",
-			Content: userInput,
+	for {
+		if readUserInput {
+			fmt.Print("\x1b[34mYou\x1b[94m: ")
+			userInput, ok := a.getUserMessage()
+			if !ok {
+				break
+			}
+
+			// append the new User message
+			userMessage := api.Message{
+				Role:    "user",
+				Content: userInput,
+			}
+			conversation = append(conversation, userMessage)
 		}
-		conversation = append(conversation, userMessage)
 
 		// run ollama inference
 		assistantMessage, err := a.runInference(ctx, conversation)
 		if err != nil {
 			return err
 		}
-
 		// append ollama's response directly to history (it is already on api.Message)
-		// #fixed conversation = append(conversation, assistantMessage.ToParam())
 		conversation = append(conversation, *assistantMessage)
 
-		// #fixed for _, content := range assistantMessage.Content { ... }
-		fmt.Printf("\x1b[35mAssistant\x1b[95m: %s\n", assistantMessage.Content)
+		if assistantMessage.Content != ""{
+			fmt.Printf("\x1b[35mGPT\x1b[95m: %s\n", assistantMessage.Content)
+		}
+		
+		toolResults := []api.Message{}
+		for _, call := range assistantMessage.ToolCalls {
+			input, err := json.Marshal(call.Function.Arguments.ToMap())
+			if err != nil {
+				return err
+			}
+
+			switch call.Function.Name {
+			case "read_file":
+				result := a.executeTool(call.ID, call.Function.Name, input)
+				toolResults = append(toolResults, result)
+
+			case "list_files":
+				result := a.executeTool(call.ID, call.Function.Name, input)
+				toolResults = append(toolResults, result)
+
+			case "edit_file":
+				result := a.executeTool(call.ID, call.Function.Name, input)
+				toolResults = append(toolResults, result)
+
+			default:
+				toolResults = append(toolResults, api.Message{
+					Role:       "tool",
+					ToolName:   call.Function.Name,
+					ToolCallID: call.ID,
+					Content:    "tool error: unknown tool",
+				})
+			}
+		}
+		if len(toolResults) == 0 {
+			readUserInput = true
+			continue
+		}
+		readUserInput = false
+		conversation = append(conversation, toolResults...)
 	}
 
 	return nil
 }
 
+// func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.ContentBlockParamUnion {
+func (a *Agent) executeTool(id, name string, input json.RawMessage) api.Message{
+	var toolDef ToolDefinition
+	var found bool
+	for _, tool := range a.tools {
+		if tool.Name == name {
+			toolDef = tool
+			found = true
+			break
+		}
+	}
+	if !found {
+		return api.Message{
+			Role:       "tool",
+			ToolName:   name,
+			ToolCallID: id,
+			Content:    "tool error: tool not found",
+		}
+	}
+
+	fmt.Printf("\033[32mtool\033[0m:%s(%s)\n", name, input)
+	response, err := toolDef.Function(input)
+	if err != nil {
+		// return anthropic.NewToolResultBlock(id, err.Error(), true)
+		return api.Message{
+			Role: "tool",
+			ToolName: name,
+			ToolCallID: id,
+			Content: "tool error: " + err.Error(),
+		}
+	}
+	// return anthropic.NewToolResultBlock(id, response, false)
+
+	return api.Message{
+		Role:       "tool",
+		ToolName:   name,
+		ToolCallID: id,
+		Content:    response,
+	}
+}
+
 func (a *Agent) runInference(ctx context.Context, conversation []api.Message) (*api.Message, error) {
+	// #fixed tools := a.tools
+	ollamaTools := make([]api.Tool, 0, len(a.tools))
+	for _, tool := range a.tools {
+		// Convert the generic JSON Schema held by ToolDefinition into the
+		// strongly typed schema required by Ollama's Go client.
+		schemaJSON, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			return nil, fmt.Errorf("marshal schema for tool %q: %w", tool.Name, err)
+		}
+
+		var parameters api.ToolFunctionParameters
+		if err := json.Unmarshal(schemaJSON, &parameters); err != nil {
+			return nil, fmt.Errorf("parse schema for tool %q: %w", tool.Name, err)
+		}
+
+		ollamaTools = append(ollamaTools, api.Tool{
+			Type: "function",
+			Function: api.ToolFunction{
+				Name:        tool.Name,
+				Description: tool.Description,
+				Parameters:  parameters,
+			},
+		})
+	}
+
 	var response api.Message
 
 	// Define the chat request configuration
@@ -104,9 +408,10 @@ func (a *Agent) runInference(ctx context.Context, conversation []api.Message) (*
 		Model:    "gpt-oss:120b-cloud",
 		Messages: conversation,
 		Stream:   new(bool), // Defaults to false, or pass a false pointer explicitly if needed
+		Tools:    ollamaTools,
 	}
 
-	// 6. Define the response callback (Ollama streams by default unless Stream is set false/handled in pieces)
+	// Define the response callback (Ollama streams by default unless Stream is set false/handled in pieces)
 	// Even with Stream: false, Ollama executes this callback block once with the complete answer.
 	err := a.client.Chat(ctx, req, func(resp api.ChatResponse) error {
 		// #fixed response = resp.Message
@@ -116,61 +421,4 @@ func (a *Agent) runInference(ctx context.Context, conversation []api.Message) (*
 
 	// #fixed return response, err
 	return &response, err
-
-	// message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-	// 	Model:     anthropic.ModelClaude3_7SonnetLatest,
-	// 	MaxTokens: int64(1024),
-	// 	Messages:  conversation,
-	// })
-	// return message, err
 }
-
-// ollama endpoints
-// Ollama exposes several key endpoints that we’ll work with:
-
-// /api/generate - Generate text based on a prompt (supports streaming)
-// /api/chat - Handle multi-turn conversations with message history
-// /api/embeddings - Create vector embeddings for text
-// /api/tags - List all pulled models
-
-// import (
-// 	"bytes"
-// 	"encoding/json"
-// 	"fmt"
-// 	"io"
-// 	"net/http"
-// )
-
-// func main(){
-
-// 	// request payload
-// 	payload := map[string]interface{}{
-// 		"model": "gemma4:e2b",
-// 		"prompt": "What is the capital of France?",
-// 		"stream": true
-// 	}
-
-// 	payloadBytes, _ := json.Marshal(payload)
-
-// 	// make the POST request
-// 	response, err := http.Post(
-// 		"http://localhost:11434/api/generate",
-// 		"application/json",
-// 		bytes.NewBuffer(payloadBytes),
-// 	)
-
-// 	if err != nil {
-// 		fmt.Println("Error making request:", err)
-// 		return
-// 	}
-
-// 	defer response.Body.Close()
-
-// 	// read and parse the response body
-// 	body, _ := io.ReadAll(response.Body)
-// 	var result map[string]interface{}
-// 	json.Unmarshal(body, &result)
-
-// 	fmt.Println("Response:", result["response"])
-
-// }
